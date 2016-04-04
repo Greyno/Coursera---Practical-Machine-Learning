@@ -1,0 +1,102 @@
+---
+title: "Practical Machine Learning Prediction Assignment - An Examination of How Well Exercises Were Performed"
+subtitle: Author - G. Reynolds
+output: html_document
+---
+
+###Synopsis:
+Six young healthy participants were asked to perform one set of 10 repetitions of the Unilateral Dumbbell Biceps Curl in five different fashions: exactly according to the specification (Class A), throwing the elbows to the front (Class B), lifting the dumbbell only halfway (Class C), lowering the dumbbell only halfway (Class D) and throwing the hips to the front (Class E). The Class designations A-E are in the classe column of the dataset (column 160). Class A corresponds to the specified execution of the exercise, while the other 4 classes correspond to common mistakes. More information can be gound at <http://groupware.les.inf.puc-rio.br/har>. To determine how well we could model this dataset, Random Forest and GBM were used, with 5-fold cross validation. The Random Forest created better accuracy on the validation data and this is the model that was chosen for the prediction on the final test dataset.
+
+###1. Data Processing and Data Loading:
+First, packages necessary to do the coming calculations were loaded into the R environment.
+```{r, echo=TRUE}
+library(caret); library(rpart); library(rpart.plot); library(randomForest); library(corrplot)
+```
+To start the analysis, a working directory was created and the data files were downloaded into this directory. As a best practice, the directory was created if it did not already exist.
+```{r, echo=TRUE, cache=TRUE}
+setwd("~/Documents/Coursera work files/Machine Learning") 
+if(!file.exists("data")){dir.create("data")}
+download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", destfile= "data/pml-training.csv", method = "curl") #Use the curl method https downloads under the Macintosh environment
+
+if(!file.exists("data")){dir.create("data")}
+download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv", destfile= "data/pml-testing.csv", method = "curl")
+dateDownloaded <- date()
+```
+The data were downloaded on `r dateDownloaded`. The pre-processing of the data was started by reading in the training file and looking at a summary.
+
+```{r, echo=TRUE, cache=TRUE}
+trainRaw <- read.csv("data/pml-training.csv"); dim(trainRaw) #19622 rows with 160 columns of data 
+testRaw <- read.csv("data/pml-testing.csv"); dim(testRaw) #20 rows with 160 columns of data
+#summary(trainRaw) 
+```
+The variable/column names are not in a suitable format (from a data analysis perspective). First we will clean the testing and training datasets by removing the '_' from the column names.
+```{r, echo=TRUE, cache=TRUE}
+names(trainRaw)<-gsub("_", "", names(trainRaw)) 
+names(testRaw)<-gsub("_", "", names(testRaw)) 
+```
+Next we remove the columns that we do not believe will contribute to the way in which the exercises were performed. These include the 'X' column and the columns related to timestamps, participant names and windows.This reduces the data to 153 columns (predictor variables).
+```{r, echo=TRUE, cache=TRUE}
+pmlTrain<-trainRaw[-c(1:7)] #Have 153 columns
+pmlTest<-testRaw[-c(1:7)] #Have 153 columns
+```
+###2. Clean the Datasets 
+There are quite a few columns with NAs in the dataset. We could use complete.cases to accept only those rows of data that are complete across the dataset (see: <http://stackoverflow.com/questions/28932098/extracting-complete-paired-values-non-na-from-a-matrix-in-r?lq=1>). However, when we do this, there are only 406 complete rows - the data will be reduced too much. So we will consider removing non-numeric columns in the training data. We need to put aside the classe column before proceeding. Once the non-numeric values are removed we will append the classe column back to the dataset. 
+```{r, echo=TRUE, cache=TRUE}
+naremovedpmlTrain <- pmlTrain[complete.cases(pmlTrain), ] 
+classe <-pmlTrain$classe
+pmlTrainCleaned<-pmlTrain[,sapply(pmlTrain, is.numeric)] #Have 119 columns
+pmlTrainCleaned <-pmlTrainCleaned[,colSums(is.na(pmlTrainCleaned)) == 0] #52 columns
+pmlTrainCleaned$classe <- classe #Put the classe column back into the training set
+```
+Repeat the datacleanup for the test dataset. The 'problemid' column in the test set is numeric, so it will not be removed when we perform the is.numeric function.
+```{r, echo=TRUE, cache=TRUE}
+pmlTestCleaned<-pmlTest[,sapply(pmlTest, is.numeric)]
+pmlTestCleaned <-pmlTestCleaned[,colSums(is.na(pmlTestCleaned)) == 0] #53 columns
+```
+We now have a training set with `r dim(pmlTrainCleaned)` observations/columns and a test set with `r dim(pmlTestCleaned)` observations/columns.
+In order to do cross validation, we will further split the training dataset into training and validation datasets, using a 70/30 ratio. The training set has 13737 observations, while the validation set has 5885 observations. We will put aside this new validation dataset and focus on the new training set.
+
+```{r, echo=TRUE, cache=TRUE}
+set.seed(125)
+inTrain <-createDataPartition(pmlTrainCleaned$classe, p=0.7, list= FALSE)
+trainData <- pmlTrainCleaned[inTrain,]
+validationData <-pmlTrainCleaned[-inTrain,]
+dim(trainData) #13737 observations, 53 columns
+dim(validationData) #5885 observations, 53 columns
+```
+###3. Exploratory Data Analysis
+Create some feature plots of the variables versus classe. There are some correlations in these plots so we can look at how the variables might be correlated. At the 95% level, there are 12 variables that are highly correlated wtih each other.
+
+```{r, echo=TRUE, cache=TRUE}
+featurePlot(x=trainData[,c(1:8)], y=trainData$classe, plot="pairs")
+M <-abs(cor(trainData[,-53]))
+diag(M) <-0
+corrOutput<-which(M>0.95, arr.ind=T) #12 variables are highly correlated w/ each other
+```
+###4. Data Modeling
+Whichever models we choose to try, we want to perform cross validation to get a sense of the accuracy of the models. There are some videos (e.g. <https://vimeo.com/75432414>) that show how to use for loops to set up n-fold datasets for cross validation. However, within R, one can use the 'trainControl' function to define the n-fold cross validation that can be used with models of choice (<http://topepo.github.io/caret/training.html>). For this project we will use 5-fold cross validation for all our modeling. Because there are quite a few variables that are correlated in the dataset, the first model to try will be Generalized Boosting Regression Modeling (GBM) with Principal Components Analysis. We first fit the model to the training set then predict on the validation dataset. 
+```{r, echo=TRUE, cache=TRUE}
+fitControl<-trainControl(method="cv", number=5, verbose=TRUE)
+modelFitGBM <- train(classe~., method= "gbm", data=trainData, preProcess=c("pca"), trControl = fitControl, verbose=FALSE) #150 trees were used
+print(modelFitGBM)
+predictGBM <-predict(modelFitGBM, newdata=validationData)
+confusionMatrix(predictGBM, validationData$classe) #Accuracy = 82.7%
+```
+Second model to try: Random forest. 
+We first fit the model to the training set then predict on the validation dataset. 
+```{r, echo=TRUE, cache=TRUE}
+trainControlRF <-trainControl(method="cv", number = 5)
+modelFitRF<-train(classe ~., method="rf", data=trainData, trControl=trainControlRF, verbose=FALSE)
+print(modelFitRF) #52 predictors; (no preprocessing)
+predictRF<-predict(modelFitRF, newdata=validationData)
+confusionMatrix(predictRF, validationData$classe) #Accuracy 99.2%
+modelFitRF$finalModel #out-of-sample error of 0.64%
+```
+The random forest gives a higher degree of accuract (99.2%) versus the GBM model (82.7%). The random forest model also had an out of smaple error rate of 0.64%. We will use the random forest to predict on the 20 observations in the final test dataset.
+
+###5. Prediction Results
+```{r, echo=TRUE, cache=TRUE}
+predict20<-predict(modelFitRF, newdata=pmlTest)
+predict20 #Results: B A B A A E D B A A B C B A E E A B B B
+```
+We therefore expect results of 'B A B A A E D B A A B C B A E E A B B B' for the 20 tests. 
